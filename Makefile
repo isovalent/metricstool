@@ -13,6 +13,10 @@ $(TARGET):
 test:
 	$(GO) test $(TEST_FLAGS) ./...
 
+.PHONY: vendor-test
+vendor-test:
+	$(MAKE) -C pkg/promlinter/testdata vendor-src
+
 .PHONY: vendor
 vendor:
 	$(GO) mod tidy && $(GO) mod vendor && $(GO) mod verify

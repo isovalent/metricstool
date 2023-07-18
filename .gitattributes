@@ -1,2 +1,4 @@
 vendor/* linguist-vendored
 go.sum   linguist-generated
+pkg/promlinter/testdata/src/*   linguist-vendored
+pkg/promlinter/testdata/go.sum  linguist-generated

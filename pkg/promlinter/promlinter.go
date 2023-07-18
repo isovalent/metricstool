@@ -1,7 +1,8 @@
 // Copyright 2020 Authors of promlinter
+// Copyright 2023 Isovalent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// This file is copied from https://github.com/yeya24/promlinter/blob/60c138a6e5b7f18dcb76c3944613722dbf84bffc/promlinter.go
+// Part of this file is copied from https://github.com/yeya24/promlinter/blob/60c138a6e5b7f18dcb76c3944613722dbf84bffc/promlinter.go
 
 package promlinter
 
@@ -9,13 +10,13 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil/promlint"
 	dto "github.com/prometheus/client_model/go"
+	"golang.org/x/tools/go/analysis"
 )
 
 var (
@@ -84,7 +85,7 @@ type Issue struct {
 
 type MetricFamilyWithPos struct {
 	MetricFamily *dto.MetricFamily
-	Pos          token.Position
+	Pos          token.Pos
 }
 
 type visitor struct {
@@ -100,34 +101,21 @@ type opt struct {
 	name      string
 }
 
-func RunList(fs *token.FileSet, files []*ast.File, strict bool) []MetricFamilyWithPos {
-	v := &visitor{
-		fs:      fs,
-		metrics: make([]MetricFamilyWithPos, 0),
-		issues:  make([]Issue, 0),
-		strict:  strict,
-	}
-
-	for _, file := range files {
-		ast.Walk(v, file)
-	}
-
-	sort.Slice(v.metrics, func(i, j int) bool {
-		return v.metrics[i].Pos.String() < v.metrics[j].Pos.String()
-	})
-	return v.metrics
+var Analyzer = &analysis.Analyzer{
+	Name: "promlinter",
+	Doc:  "Checks Prometheus metrics conventions.",
+	Run:  run,
 }
 
-func RunLint(fs *token.FileSet, files []*ast.File, s Setting) []Issue {
+func run(pass *analysis.Pass) (interface{}, error) {
 	v := &visitor{
-		fs:      fs,
+		fs:      pass.Fset,
 		metrics: make([]MetricFamilyWithPos, 0),
 		issues:  make([]Issue, 0),
-		strict:  s.Strict,
 	}
 
-	for _, file := range files {
-		ast.Walk(v, file)
+	for _, f := range pass.Files {
+		ast.Walk(v, f)
 	}
 
 	// lint metrics
@@ -138,28 +126,11 @@ func RunLint(fs *token.FileSet, files []*ast.File, s Setting) []Issue {
 		}
 
 		for _, p := range problems {
-			for _, disabledFunc := range s.DisabledLintFuncs {
-				for _, pattern := range lintFuncText[disabledFunc] {
-					if strings.Contains(p.Text, pattern) {
-						goto END
-					}
-				}
-			}
-
-			v.issues = append(v.issues, Issue{
-				Pos:    mfp.Pos,
-				Metric: p.Metric,
-				Text:   p.Text,
-			})
-
-		END:
+			pass.Reportf(mfp.Pos, "%s, metric: %s", p.Text, p.Metric)
 		}
 	}
 
-	sort.Slice(v.issues, func(i, j int) bool {
-		return v.issues[i].Pos.String() < v.issues[j].Pos.String()
-	})
-	return v.issues
+	return nil, nil
 }
 
 func (v *visitor) Visit(n ast.Node) ast.Visitor {
@@ -264,7 +235,6 @@ func (v *visitor) parseCallerExpr(call *ast.CallExpr) ast.Visitor {
 
 func (v *visitor) parseOpts(optArg ast.Node, metricType dto.MetricType) ast.Visitor {
 	// position for the first arg of the CallExpr
-	optsPosition := v.fs.Position(optArg.Pos())
 	opts, help := v.parseOptsExpr(optArg)
 	if opts == nil {
 		return v
@@ -283,13 +253,12 @@ func (v *visitor) parseOpts(optArg ast.Node, metricType dto.MetricType) ast.Visi
 	}
 	currentMetric.Name = &metricName
 
-	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: optsPosition})
+	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: optArg.Pos()})
 	return v
 }
 
 // Parser for kube-state-metrics generators.
 func (v *visitor) parseKSMMetrics(nameArg ast.Node, helpArg ast.Node, metricTypeArg ast.Node) ast.Visitor {
-	optsPosition := v.fs.Position(nameArg.Pos())
 	currentMetric := dto.MetricFamily{}
 	name, ok := v.parseValue("name", nameArg)
 	if !ok {
@@ -312,7 +281,7 @@ func (v *visitor) parseKSMMetrics(nameArg ast.Node, helpArg ast.Node, metricType
 		}
 	}
 
-	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: optsPosition})
+	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: nameArg.Pos()})
 	return v
 }
 
@@ -378,7 +347,7 @@ func (v *visitor) parseSendMetricChanExpr(chExpr *ast.SendStmt) ast.Visitor {
 		metric.Type = &metricType
 	}
 
-	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: metric, Pos: v.fs.Position(call.Pos())})
+	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: metric, Pos: call.Pos()})
 	return v
 }
 
