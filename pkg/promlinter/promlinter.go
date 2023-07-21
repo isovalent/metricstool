@@ -76,11 +76,10 @@ type Setting struct {
 	DisabledLintFuncs []string
 }
 
-// Issue contains metric name, error text and metric position.
+// Issue indicates a parsing failure
 type Issue struct {
-	Text   string
-	Metric string
-	Pos    token.Position
+	Text string
+	Pos  token.Pos
 }
 
 type MetricFamilyWithPos struct {
@@ -112,13 +111,19 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		fs:      pass.Fset,
 		metrics: make([]MetricFamilyWithPos, 0),
 		issues:  make([]Issue, 0),
+		strict:  true,
 	}
 
 	for _, f := range pass.Files {
 		ast.Walk(v, f)
 	}
 
-	// lint metrics
+	// Report parsing failures
+	for _, iss := range v.issues {
+		pass.Reportf(iss.Pos, iss.Text)
+	}
+
+	// Lint metrics and report problems
 	for _, mfp := range v.metrics {
 		problems, err := promlint.NewWithMetricFamilies([]*dto.MetricFamily{mfp.MetricFamily}).Lint()
 		if err != nil {
@@ -219,9 +224,8 @@ func (v *visitor) parseCallerExpr(call *ast.CallExpr) ast.Visitor {
 	// The methods used to initialize metrics should have at least one arg.
 	if len(call.Args) < argNum && v.strict {
 		v.issues = append(v.issues, Issue{
-			Pos:    v.fs.Position(call.Pos()),
-			Metric: "",
-			Text:   fmt.Sprintf("%s should have at least %d arguments", methodName, argNum),
+			Pos:  call.Pos(),
+			Text: fmt.Sprintf("%s should have at least %d arguments", methodName, argNum),
 		})
 		return v
 	}
@@ -314,9 +318,8 @@ func (v *visitor) parseSendMetricChanExpr(chExpr *ast.SendStmt) ast.Visitor {
 
 	if len(call.Args) < requiredArgNum && v.strict {
 		v.issues = append(v.issues, Issue{
-			Metric: "",
-			Pos:    v.fs.Position(call.Pos()),
-			Text:   fmt.Sprintf("%s should have at least %d arguments", methodName, requiredArgNum),
+			Pos:  call.Pos(),
+			Text: fmt.Sprintf("%s should have at least %d arguments", methodName, requiredArgNum),
 		})
 		return v
 	}
@@ -459,9 +462,8 @@ func (v *visitor) parseValue(object string, n ast.Node) (string, bool) {
 	default:
 		if v.strict {
 			v.issues = append(v.issues, Issue{
-				Pos:    v.fs.Position(n.Pos()),
-				Metric: "",
-				Text:   fmt.Sprintf("parsing %s with type %T is not supported", object, t),
+				Pos:  n.Pos(),
+				Text: fmt.Sprintf("parsing %s with type %T is not supported", object, t),
 			})
 		}
 	}
@@ -504,9 +506,8 @@ func (v *visitor) parseValueCallExpr(object string, call *ast.CallExpr) (string,
 
 	if v.strict {
 		v.issues = append(v.issues, Issue{
-			Metric: "",
-			Pos:    v.fs.Position(call.Pos()),
-			Text:   fmt.Sprintf("parsing %s with function %s is not supported", object, methodName),
+			Pos:  call.Pos(),
+			Text: fmt.Sprintf("parsing %s with function %s is not supported", object, methodName),
 		})
 	}
 
@@ -537,9 +538,8 @@ func (v *visitor) parseConstMetricOptsExpr(n ast.Node) (*string, *string) {
 
 			if v.strict {
 				v.issues = append(v.issues, Issue{
-					Pos:    v.fs.Position(stmt.Pos()),
-					Metric: "",
-					Text:   fmt.Sprintf("parsing desc of type %T is not supported", stmt.Obj.Decl),
+					Pos:  stmt.Pos(),
+					Text: fmt.Sprintf("parsing desc of type %T is not supported", stmt.Obj.Decl),
 				})
 			}
 		}
@@ -547,9 +547,8 @@ func (v *visitor) parseConstMetricOptsExpr(n ast.Node) (*string, *string) {
 	default:
 		if v.strict {
 			v.issues = append(v.issues, Issue{
-				Pos:    v.fs.Position(stmt.Pos()),
-				Metric: "",
-				Text:   fmt.Sprintf("parsing desc of type %T is not supported", stmt),
+				Pos:  stmt.Pos(),
+				Text: fmt.Sprintf("parsing desc of type %T is not supported", stmt),
 			})
 		}
 	}
@@ -569,9 +568,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 		if expr.Name != "NewDesc" {
 			if v.strict {
 				v.issues = append(v.issues, Issue{
-					Pos:    v.fs.Position(expr.Pos()),
-					Metric: "",
-					Text:   fmt.Sprintf("parsing desc with function %s is not supported", expr.Name),
+					Pos:  expr.Pos(),
+					Text: fmt.Sprintf("parsing desc with function %s is not supported", expr.Name),
 				})
 			}
 			return nil, nil
@@ -580,9 +578,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 		if expr.Sel.Name != "NewDesc" {
 			if v.strict {
 				v.issues = append(v.issues, Issue{
-					Pos:    v.fs.Position(expr.Sel.Pos()),
-					Metric: "",
-					Text:   fmt.Sprintf("parsing desc with function %s is not supported", expr.Sel.Name),
+					Pos:  expr.Sel.Pos(),
+					Text: fmt.Sprintf("parsing desc with function %s is not supported", expr.Sel.Name),
 				})
 			}
 			return nil, nil
@@ -590,9 +587,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 	default:
 		if v.strict {
 			v.issues = append(v.issues, Issue{
-				Pos:    v.fs.Position(expr.Pos()),
-				Metric: "",
-				Text:   fmt.Sprintf("parsing desc of %T is not supported", expr),
+				Pos:  expr.Pos(),
+				Text: fmt.Sprintf("parsing desc of %T is not supported", expr),
 			})
 		}
 		return nil, nil
@@ -602,9 +598,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 	// while prometheus.NewDesc has 4 args
 	if len(call.Args) < 4 && v.strict {
 		v.issues = append(v.issues, Issue{
-			Metric: "",
-			Pos:    v.fs.Position(call.Pos()),
-			Text:   "NewDesc should have at least 4 args",
+			Pos:  call.Pos(),
+			Text: "NewDesc should have at least 4 args",
 		})
 		return nil, nil
 	}
