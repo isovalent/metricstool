@@ -14,6 +14,8 @@ import (
 	"k8s.io/component-base/metrics"
 	"k8s.io/kube-state-metrics/v2/pkg/metric"
 	generator "k8s.io/kube-state-metrics/v2/pkg/metric_generator"
+
+	"./p"
 )
 
 var (
@@ -135,6 +137,17 @@ func main() {
 	// We skip linting these case when metric name is not set.
 	promauto.With(nil).NewCounter(prometheus.CounterOpts{})
 	promauto.With(nil).NewCounterVec(prometheus.CounterOpts{}, nil)
+
+	// Support imported constants
+	_ = promauto.NewCounterVec(
+		prometheus.CounterOpts{ // want `counter metrics should have "_total" suffix, metric: metricstool_metricstool_test_metric`
+			Namespace: p.Prefix,
+			Subsystem: p.Prefix,
+			Name:      "test_metric",
+			Help:      "test help text",
+		},
+		[]string{},
+	)
 }
 
 func newDesc(subsystem, name, help string) *prometheus.Desc {

@@ -9,7 +9,9 @@ package promlinter
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
+	"go/types"
 	"strconv"
 	"strings"
 
@@ -88,10 +90,11 @@ type MetricFamilyWithPos struct {
 }
 
 type visitor struct {
-	fs      *token.FileSet
-	metrics []MetricFamilyWithPos
-	issues  []Issue
-	strict  bool
+	fs        *token.FileSet
+	metrics   []MetricFamilyWithPos
+	issues    []Issue
+	strict    bool
+	typesInfo *types.Info
 }
 
 type opt struct {
@@ -108,10 +111,11 @@ var Analyzer = &analysis.Analyzer{
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	v := &visitor{
-		fs:      pass.Fset,
-		metrics: make([]MetricFamilyWithPos, 0),
-		issues:  make([]Issue, 0),
-		strict:  true,
+		fs:        pass.Fset,
+		metrics:   make([]MetricFamilyWithPos, 0),
+		issues:    make([]Issue, 0),
+		strict:    true,
+		typesInfo: pass.TypesInfo,
 	}
 
 	for _, f := range pass.Files {
@@ -455,9 +459,28 @@ func (v *visitor) parseValue(object string, n ast.Node) (string, bool) {
 			return x + y, true
 		}
 
-	// We can only cover some basic cases here
+	// Supporting only prometheus.BuildFQName here.
+	// If the package defines custom BuildFQName with 3 arguments, it will be
+	// parsed too, but evaluated as prometheus.BuildFQName.
 	case *ast.CallExpr:
 		return v.parseValueCallExpr(object, t)
+
+	// Imported constants
+	case *ast.SelectorExpr:
+		tv, ok := v.typesInfo.Types[t]
+		if !ok {
+			return "", false
+		}
+		// Not a string constant
+		if tv.Value == nil || !types.Identical(tv.Type, types.Typ[types.String]) {
+			v.issues = append(v.issues, Issue{
+				Pos:  n.Pos(),
+				Text: fmt.Sprintf("parsing %s with type *ast.SelectorExpr is supported only for string constants", object),
+			})
+			return "", false
+		}
+
+		return constant.StringVal(tv.Value), true
 
 	default:
 		if v.strict {
