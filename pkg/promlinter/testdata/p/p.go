@@ -4,3 +4,8 @@
 package p
 
 const Prefix = "metricstool"
+
+var (
+	MetricNamespace, MetricSubsystem = "promlinter", "testdata"
+	MetricName                       = "errors"
+)

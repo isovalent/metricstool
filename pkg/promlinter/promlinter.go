@@ -90,11 +90,11 @@ type MetricFamilyWithPos struct {
 }
 
 type visitor struct {
-	fs        *token.FileSet
-	metrics   []MetricFamilyWithPos
-	issues    []Issue
-	strict    bool
-	typesInfo *types.Info
+	fs      *token.FileSet
+	metrics []MetricFamilyWithPos
+	issues  []Issue
+	strict  bool
+	pass    *analysis.Pass
 }
 
 type opt struct {
@@ -104,20 +104,30 @@ type opt struct {
 }
 
 var Analyzer = &analysis.Analyzer{
-	Name: "promlinter",
-	Doc:  "Checks Prometheus metrics conventions.",
-	Run:  run,
+	Name:      "promlinter",
+	Doc:       "Checks Prometheus metrics conventions.",
+	Run:       run,
+	FactTypes: []analysis.Fact{new(varValue)},
 }
+
+type varValue string
+
+// dummy method to satisfy analysis.Fact interface
+func (*varValue) AFact() {}
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	v := &visitor{
-		fs:        pass.Fset,
-		metrics:   make([]MetricFamilyWithPos, 0),
-		issues:    make([]Issue, 0),
-		strict:    true,
-		typesInfo: pass.TypesInfo,
+		fs:      pass.Fset,
+		metrics: make([]MetricFamilyWithPos, 0),
+		issues:  make([]Issue, 0),
+		strict:  true,
+		pass:    pass,
 	}
 
+	// Save (initial) values of exported string variables for future use
+	v.exportVarValues()
+
+	// Traverse the AST
 	for _, f := range pass.Files {
 		ast.Walk(v, f)
 	}
@@ -140,6 +150,41 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	}
 
 	return nil, nil
+}
+
+func (v *visitor) exportVarValues() {
+	for _, f := range v.pass.Files {
+	decls:
+		for _, d := range f.Decls {
+			// Check that it's a var declaration
+			decl, ok := d.(*ast.GenDecl)
+			if !ok || decl.Tok != token.VAR {
+				continue decls
+			}
+		specs:
+			for _, s := range decl.Specs {
+				// It's safe to assume the type here because it's a var declaration
+				spec, _ := s.(*ast.ValueSpec)
+				if len(spec.Values) == 0 {
+					continue specs
+				}
+			vars:
+				for i, name := range spec.Names {
+					// Convert to types.Object
+					typesObj, ok := v.pass.TypesInfo.Defs[name]
+					// Check that the var is exported and a string
+					if !ok || !typesObj.Exported() || !types.Identical(typesObj.Type(), types.Typ[types.String]) {
+						continue vars
+					}
+					if value, ok := v.parseValue("", spec.Values[i]); ok {
+						// Export the value as analysis.Fact
+						valueFact := varValue(value)
+						v.pass.ExportObjectFact(typesObj, &valueFact)
+					}
+				}
+			}
+		}
+	}
 }
 
 func (v *visitor) Visit(n ast.Node) ast.Visitor {
@@ -437,6 +482,7 @@ func (v *visitor) parseValue(object string, n ast.Node) (string, bool) {
 			return v.parseValue(object, vs)
 		}
 
+	// Supporting only single-value declarations here.
 	case *ast.ValueSpec:
 		if len(t.Values) == 0 {
 			return "", false
@@ -465,22 +511,34 @@ func (v *visitor) parseValue(object string, n ast.Node) (string, bool) {
 	case *ast.CallExpr:
 		return v.parseValueCallExpr(object, t)
 
-	// Imported constants
+	// Imported constants and variables
 	case *ast.SelectorExpr:
-		tv, ok := v.typesInfo.Types[t]
+		// constant
+		tv, ok := v.pass.TypesInfo.Types[t]
 		if !ok {
 			return "", false
 		}
-		// Not a string constant
-		if tv.Value == nil || !types.Identical(tv.Type, types.Typ[types.String]) {
-			v.issues = append(v.issues, Issue{
-				Pos:  n.Pos(),
-				Text: fmt.Sprintf("parsing %s with type *ast.SelectorExpr is supported only for string constants", object),
-			})
-			return "", false
+		if tv.Value != nil && types.Identical(tv.Type, types.Typ[types.String]) {
+			return constant.StringVal(tv.Value), true
 		}
 
-		return constant.StringVal(tv.Value), true
+		// variable
+		typesObj, ok := v.pass.TypesInfo.Uses[t.Sel]
+		if !ok {
+			return "", false
+		}
+		valueFact := new(varValue)
+		if ok := v.pass.ImportObjectFact(typesObj, valueFact); ok {
+			// It's safe to cast here because we exported only string variables
+			return string(*valueFact), true
+		}
+
+		if v.strict {
+			v.issues = append(v.issues, Issue{
+				Pos:  n.Pos(),
+				Text: "parsing selector expressions is supported only for imported string constants and variables",
+			})
+		}
 
 	default:
 		if v.strict {

@@ -148,6 +148,17 @@ func main() {
 		},
 		[]string{},
 	)
+
+	// Support imported variables
+	_ = promauto.NewCounterVec(
+		prometheus.CounterOpts{ // want `counter metrics should have "_total" suffix, metric: promlinter_testdata_errors`
+			Namespace: p.MetricNamespace,
+			Subsystem: p.MetricSubsystem,
+			Name:      p.MetricName,
+			Help:      "test help text",
+		},
+		[]string{},
+	)
 }
 
 func newDesc(subsystem, name, help string) *prometheus.Desc {
