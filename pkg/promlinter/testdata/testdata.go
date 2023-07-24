@@ -1,17 +1,21 @@
 // Copyright 2020 Authors of promlinter
+// Copyright 2023 Isovalent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// This file is copied from https://github.com/yeya24/promlinter/blob/60c138a6e5b7f18dcb76c3944613722dbf84bffc/testdata/testdata.go
+// Part of this file is copied from https://github.com/yeya24/promlinter/blob/60c138a6e5b7f18dcb76c3944613722dbf84bffc/testdata/testdata.go
 
 // examples for testing
 
-package testdata
+package main
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"k8s.io/component-base/metrics"
 	"k8s.io/kube-state-metrics/v2/pkg/metric"
 	generator "k8s.io/kube-state-metrics/v2/pkg/metric_generator"
+
+	"./p"
 )
 
 var (
@@ -24,7 +28,7 @@ func main() {
 
 	// counter metric should have _total suffix
 	_ = promauto.NewCounterVec(
-		prometheus.CounterOpts{
+		prometheus.CounterOpts{ // want `counter metrics should have "_total" suffix, metric: test_metric_name`
 			Name: "test_metric_name",
 			Help: "test help text",
 		},
@@ -33,14 +37,14 @@ func main() {
 
 	// no help text
 	_ = promauto.NewCounterVec(
-		prometheus.CounterOpts{
+		prometheus.CounterOpts{ // want `no help text, metric: test_metric_total`
 			Name: "test_metric_total",
 		},
 		[]string{},
 	)
 
 	// NewCounterFunc, should have _total suffix
-	_ = promauto.NewCounterFunc(prometheus.CounterOpts{
+	_ = promauto.NewCounterFunc(prometheus.CounterOpts{ // want `counter metrics should have "_total" suffix, metric: foo`
 		Name: "foo",
 		Help: "bar",
 	}, func() float64 {
@@ -79,7 +83,7 @@ func main() {
 
 	// support using BuildFQName to generate fqName here.
 	// bad metric, gauge shouldn't have _total
-	ch <- prometheus.MustNewConstMetric(prometheus.NewDesc(
+	ch <- prometheus.MustNewConstMetric(prometheus.NewDesc( // want `non-counter metrics should not have "_total" suffix, metric: foo`
 		prometheus.BuildFQName("foo", "bar", "total"),
 		"Number of expected replicas for the object.",
 		[]string{
@@ -93,10 +97,10 @@ func main() {
 		"Gauge Help",
 		[]string{}, nil, metrics.STABLE, "",
 	)
-	ch <- metrics.NewLazyConstMetric(kubeMetricDesc, metrics.GaugeValue, 1)
+	ch <- metrics.NewLazyConstMetric(kubeMetricDesc, metrics.GaugeValue, 1) // want `non-histogram and non-summary metrics should not have "_count" suffix, metric: kube_test_metric_count`
 
 	// bad
-	_ = metrics.NewHistogram(&metrics.HistogramOpts{
+	_ = metrics.NewHistogram(&metrics.HistogramOpts{ // want `metric name should not include type 'histogram', metric: test_histogram_duration_seconds`
 		Name: "test_histogram_duration_seconds",
 		Help: "",
 	})
@@ -104,7 +108,7 @@ func main() {
 	// https://github.com/prometheus/mysqld_exporter/blob/master/collector/engine_innodb.go#L78-L82
 	// This is not supported because we cannot infer what newDesc is doing before runtime.
 	ch <- prometheus.MustNewConstMetric(
-		newDesc("innodb", "queries_inside_innodb", "Queries inside InnoDB."),
+		newDesc("innodb", "queries_inside_innodb", "Queries inside InnoDB."), // want `parsing desc with function newDesc is not supported`
 		prometheus.GaugeValue,
 		1,
 	)
@@ -112,17 +116,19 @@ func main() {
 	// metrics for kube-state-metrics
 	_ = []generator.FamilyGenerator{
 		// good
-		*generator.NewFamilyGenerator(
+		*generator.NewFamilyGeneratorWithStability(
 			"kube_daemonset_created",
 			"foo",
 			metric.Gauge,
+			metrics.STABLE,
 			"",
 			nil,
 		),
-		*generator.NewFamilyGenerator(
+		*generator.NewFamilyGeneratorWithStability(
 			descDaemonSetLabelsName,
 			descDaemonSetLabelsHelp,
 			metric.Counter,
+			metrics.STABLE,
 			"",
 			nil,
 		),
@@ -131,6 +137,28 @@ func main() {
 	// We skip linting these case when metric name is not set.
 	promauto.With(nil).NewCounter(prometheus.CounterOpts{})
 	promauto.With(nil).NewCounterVec(prometheus.CounterOpts{}, nil)
+
+	// Support imported constants
+	_ = promauto.NewCounterVec(
+		prometheus.CounterOpts{ // want `counter metrics should have "_total" suffix, metric: metricstool_metricstool_test_metric`
+			Namespace: p.Prefix,
+			Subsystem: p.Prefix,
+			Name:      "test_metric",
+			Help:      "test help text",
+		},
+		[]string{},
+	)
+
+	// Support imported variables
+	_ = promauto.NewCounterVec(
+		prometheus.CounterOpts{ // want `counter metrics should have "_total" suffix, metric: promlinter_testdata_errors`
+			Namespace: p.MetricNamespace,
+			Subsystem: p.MetricSubsystem,
+			Name:      p.MetricName,
+			Help:      "test help text",
+		},
+		[]string{},
+	)
 }
 
 func newDesc(subsystem, name, help string) *prometheus.Desc {

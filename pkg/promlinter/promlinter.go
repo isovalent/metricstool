@@ -1,21 +1,24 @@
 // Copyright 2020 Authors of promlinter
+// Copyright 2023 Isovalent Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// This file is copied from https://github.com/yeya24/promlinter/blob/60c138a6e5b7f18dcb76c3944613722dbf84bffc/promlinter.go
+// Part of this file is copied from https://github.com/yeya24/promlinter/blob/60c138a6e5b7f18dcb76c3944613722dbf84bffc/promlinter.go
 
 package promlinter
 
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
-	"sort"
+	"go/types"
 	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil/promlint"
 	dto "github.com/prometheus/client_model/go"
+	"golang.org/x/tools/go/analysis"
 )
 
 var (
@@ -75,16 +78,15 @@ type Setting struct {
 	DisabledLintFuncs []string
 }
 
-// Issue contains metric name, error text and metric position.
+// Issue indicates a parsing failure
 type Issue struct {
-	Text   string
-	Metric string
-	Pos    token.Position
+	Text string
+	Pos  token.Pos
 }
 
 type MetricFamilyWithPos struct {
 	MetricFamily *dto.MetricFamily
-	Pos          token.Position
+	Pos          token.Pos
 }
 
 type visitor struct {
@@ -92,6 +94,7 @@ type visitor struct {
 	metrics []MetricFamilyWithPos
 	issues  []Issue
 	strict  bool
+	pass    *analysis.Pass
 }
 
 type opt struct {
@@ -100,37 +103,41 @@ type opt struct {
 	name      string
 }
 
-func RunList(fs *token.FileSet, files []*ast.File, strict bool) []MetricFamilyWithPos {
-	v := &visitor{
-		fs:      fs,
-		metrics: make([]MetricFamilyWithPos, 0),
-		issues:  make([]Issue, 0),
-		strict:  strict,
-	}
-
-	for _, file := range files {
-		ast.Walk(v, file)
-	}
-
-	sort.Slice(v.metrics, func(i, j int) bool {
-		return v.metrics[i].Pos.String() < v.metrics[j].Pos.String()
-	})
-	return v.metrics
+var Analyzer = &analysis.Analyzer{
+	Name:      "promlinter",
+	Doc:       "Checks Prometheus metrics conventions.",
+	Run:       run,
+	FactTypes: []analysis.Fact{new(varValue)},
 }
 
-func RunLint(fs *token.FileSet, files []*ast.File, s Setting) []Issue {
+type varValue string
+
+// dummy method to satisfy analysis.Fact interface
+func (*varValue) AFact() {}
+
+func run(pass *analysis.Pass) (interface{}, error) {
 	v := &visitor{
-		fs:      fs,
+		fs:      pass.Fset,
 		metrics: make([]MetricFamilyWithPos, 0),
 		issues:  make([]Issue, 0),
-		strict:  s.Strict,
+		strict:  true,
+		pass:    pass,
 	}
 
-	for _, file := range files {
-		ast.Walk(v, file)
+	// Save (initial) values of exported string variables for future use
+	v.exportVarValues()
+
+	// Traverse the AST
+	for _, f := range pass.Files {
+		ast.Walk(v, f)
 	}
 
-	// lint metrics
+	// Report parsing failures
+	for _, iss := range v.issues {
+		pass.Reportf(iss.Pos, iss.Text)
+	}
+
+	// Lint metrics and report problems
 	for _, mfp := range v.metrics {
 		problems, err := promlint.NewWithMetricFamilies([]*dto.MetricFamily{mfp.MetricFamily}).Lint()
 		if err != nil {
@@ -138,28 +145,46 @@ func RunLint(fs *token.FileSet, files []*ast.File, s Setting) []Issue {
 		}
 
 		for _, p := range problems {
-			for _, disabledFunc := range s.DisabledLintFuncs {
-				for _, pattern := range lintFuncText[disabledFunc] {
-					if strings.Contains(p.Text, pattern) {
-						goto END
-					}
-				}
-			}
-
-			v.issues = append(v.issues, Issue{
-				Pos:    mfp.Pos,
-				Metric: p.Metric,
-				Text:   p.Text,
-			})
-
-		END:
+			pass.Reportf(mfp.Pos, "%s, metric: %s", p.Text, p.Metric)
 		}
 	}
 
-	sort.Slice(v.issues, func(i, j int) bool {
-		return v.issues[i].Pos.String() < v.issues[j].Pos.String()
-	})
-	return v.issues
+	return nil, nil
+}
+
+func (v *visitor) exportVarValues() {
+	for _, f := range v.pass.Files {
+	decls:
+		for _, d := range f.Decls {
+			// Check that it's a var declaration
+			decl, ok := d.(*ast.GenDecl)
+			if !ok || decl.Tok != token.VAR {
+				continue decls
+			}
+		specs:
+			for _, s := range decl.Specs {
+				// It's safe to assume the type here because it's a var declaration
+				spec, _ := s.(*ast.ValueSpec)
+				if len(spec.Values) == 0 {
+					continue specs
+				}
+			vars:
+				for i, name := range spec.Names {
+					// Convert to types.Object
+					typesObj, ok := v.pass.TypesInfo.Defs[name]
+					// Check that the var is exported and a string
+					if !ok || !typesObj.Exported() || !types.Identical(typesObj.Type(), types.Typ[types.String]) {
+						continue vars
+					}
+					if value, ok := v.parseValue("", spec.Values[i]); ok {
+						// Export the value as analysis.Fact
+						valueFact := varValue(value)
+						v.pass.ExportObjectFact(typesObj, &valueFact)
+					}
+				}
+			}
+		}
+	}
 }
 
 func (v *visitor) Visit(n ast.Node) ast.Visitor {
@@ -248,9 +273,8 @@ func (v *visitor) parseCallerExpr(call *ast.CallExpr) ast.Visitor {
 	// The methods used to initialize metrics should have at least one arg.
 	if len(call.Args) < argNum && v.strict {
 		v.issues = append(v.issues, Issue{
-			Pos:    v.fs.Position(call.Pos()),
-			Metric: "",
-			Text:   fmt.Sprintf("%s should have at least %d arguments", methodName, argNum),
+			Pos:  call.Pos(),
+			Text: fmt.Sprintf("%s should have at least %d arguments", methodName, argNum),
 		})
 		return v
 	}
@@ -264,7 +288,6 @@ func (v *visitor) parseCallerExpr(call *ast.CallExpr) ast.Visitor {
 
 func (v *visitor) parseOpts(optArg ast.Node, metricType dto.MetricType) ast.Visitor {
 	// position for the first arg of the CallExpr
-	optsPosition := v.fs.Position(optArg.Pos())
 	opts, help := v.parseOptsExpr(optArg)
 	if opts == nil {
 		return v
@@ -283,13 +306,12 @@ func (v *visitor) parseOpts(optArg ast.Node, metricType dto.MetricType) ast.Visi
 	}
 	currentMetric.Name = &metricName
 
-	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: optsPosition})
+	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: optArg.Pos()})
 	return v
 }
 
 // Parser for kube-state-metrics generators.
 func (v *visitor) parseKSMMetrics(nameArg ast.Node, helpArg ast.Node, metricTypeArg ast.Node) ast.Visitor {
-	optsPosition := v.fs.Position(nameArg.Pos())
 	currentMetric := dto.MetricFamily{}
 	name, ok := v.parseValue("name", nameArg)
 	if !ok {
@@ -312,7 +334,7 @@ func (v *visitor) parseKSMMetrics(nameArg ast.Node, helpArg ast.Node, metricType
 		}
 	}
 
-	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: optsPosition})
+	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: &currentMetric, Pos: nameArg.Pos()})
 	return v
 }
 
@@ -345,9 +367,8 @@ func (v *visitor) parseSendMetricChanExpr(chExpr *ast.SendStmt) ast.Visitor {
 
 	if len(call.Args) < requiredArgNum && v.strict {
 		v.issues = append(v.issues, Issue{
-			Metric: "",
-			Pos:    v.fs.Position(call.Pos()),
-			Text:   fmt.Sprintf("%s should have at least %d arguments", methodName, requiredArgNum),
+			Pos:  call.Pos(),
+			Text: fmt.Sprintf("%s should have at least %d arguments", methodName, requiredArgNum),
 		})
 		return v
 	}
@@ -378,7 +399,7 @@ func (v *visitor) parseSendMetricChanExpr(chExpr *ast.SendStmt) ast.Visitor {
 		metric.Type = &metricType
 	}
 
-	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: metric, Pos: v.fs.Position(call.Pos())})
+	v.metrics = append(v.metrics, MetricFamilyWithPos{MetricFamily: metric, Pos: call.Pos()})
 	return v
 }
 
@@ -461,6 +482,7 @@ func (v *visitor) parseValue(object string, n ast.Node) (string, bool) {
 			return v.parseValue(object, vs)
 		}
 
+	// Supporting only single-value declarations here.
 	case *ast.ValueSpec:
 		if len(t.Values) == 0 {
 			return "", false
@@ -483,16 +505,46 @@ func (v *visitor) parseValue(object string, n ast.Node) (string, bool) {
 			return x + y, true
 		}
 
-	// We can only cover some basic cases here
+	// Supporting only prometheus.BuildFQName here.
+	// If the package defines custom BuildFQName with 3 arguments, it will be
+	// parsed too, but evaluated as prometheus.BuildFQName.
 	case *ast.CallExpr:
 		return v.parseValueCallExpr(object, t)
+
+	// Imported constants and variables
+	case *ast.SelectorExpr:
+		// constant
+		tv, ok := v.pass.TypesInfo.Types[t]
+		if !ok {
+			return "", false
+		}
+		if tv.Value != nil && types.Identical(tv.Type, types.Typ[types.String]) {
+			return constant.StringVal(tv.Value), true
+		}
+
+		// variable
+		typesObj, ok := v.pass.TypesInfo.Uses[t.Sel]
+		if !ok {
+			return "", false
+		}
+		valueFact := new(varValue)
+		if ok := v.pass.ImportObjectFact(typesObj, valueFact); ok {
+			// It's safe to cast here because we exported only string variables
+			return string(*valueFact), true
+		}
+
+		if v.strict {
+			v.issues = append(v.issues, Issue{
+				Pos:  n.Pos(),
+				Text: "parsing selector expressions is supported only for imported string constants and variables",
+			})
+		}
 
 	default:
 		if v.strict {
 			v.issues = append(v.issues, Issue{
-				Pos:    v.fs.Position(n.Pos()),
-				Metric: "",
-				Text:   fmt.Sprintf("parsing %s with type %T is not supported", object, t),
+				Pos:  n.Pos(),
+				Text: fmt.Sprintf("parsing %s with type %T is not supported", object, t),
 			})
 		}
 	}
@@ -535,9 +587,8 @@ func (v *visitor) parseValueCallExpr(object string, call *ast.CallExpr) (string,
 
 	if v.strict {
 		v.issues = append(v.issues, Issue{
-			Metric: "",
-			Pos:    v.fs.Position(call.Pos()),
-			Text:   fmt.Sprintf("parsing %s with function %s is not supported", object, methodName),
+			Pos:  call.Pos(),
+			Text: fmt.Sprintf("parsing %s with function %s is not supported", object, methodName),
 		})
 	}
 
@@ -568,9 +619,8 @@ func (v *visitor) parseConstMetricOptsExpr(n ast.Node) (*string, *string) {
 
 			if v.strict {
 				v.issues = append(v.issues, Issue{
-					Pos:    v.fs.Position(stmt.Pos()),
-					Metric: "",
-					Text:   fmt.Sprintf("parsing desc of type %T is not supported", stmt.Obj.Decl),
+					Pos:  stmt.Pos(),
+					Text: fmt.Sprintf("parsing desc of type %T is not supported", stmt.Obj.Decl),
 				})
 			}
 		}
@@ -578,9 +628,8 @@ func (v *visitor) parseConstMetricOptsExpr(n ast.Node) (*string, *string) {
 	default:
 		if v.strict {
 			v.issues = append(v.issues, Issue{
-				Pos:    v.fs.Position(stmt.Pos()),
-				Metric: "",
-				Text:   fmt.Sprintf("parsing desc of type %T is not supported", stmt),
+				Pos:  stmt.Pos(),
+				Text: fmt.Sprintf("parsing desc of type %T is not supported", stmt),
 			})
 		}
 	}
@@ -600,9 +649,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 		if expr.Name != "NewDesc" {
 			if v.strict {
 				v.issues = append(v.issues, Issue{
-					Pos:    v.fs.Position(expr.Pos()),
-					Metric: "",
-					Text:   fmt.Sprintf("parsing desc with function %s is not supported", expr.Name),
+					Pos:  expr.Pos(),
+					Text: fmt.Sprintf("parsing desc with function %s is not supported", expr.Name),
 				})
 			}
 			return nil, nil
@@ -611,9 +659,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 		if expr.Sel.Name != "NewDesc" {
 			if v.strict {
 				v.issues = append(v.issues, Issue{
-					Pos:    v.fs.Position(expr.Sel.Pos()),
-					Metric: "",
-					Text:   fmt.Sprintf("parsing desc with function %s is not supported", expr.Sel.Name),
+					Pos:  expr.Sel.Pos(),
+					Text: fmt.Sprintf("parsing desc with function %s is not supported", expr.Sel.Name),
 				})
 			}
 			return nil, nil
@@ -621,9 +668,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 	default:
 		if v.strict {
 			v.issues = append(v.issues, Issue{
-				Pos:    v.fs.Position(expr.Pos()),
-				Metric: "",
-				Text:   fmt.Sprintf("parsing desc of %T is not supported", expr),
+				Pos:  expr.Pos(),
+				Text: fmt.Sprintf("parsing desc of %T is not supported", expr),
 			})
 		}
 		return nil, nil
@@ -633,9 +679,8 @@ func (v *visitor) parseNewDescCallExpr(call *ast.CallExpr) (*string, *string) {
 	// while prometheus.NewDesc has 4 args
 	if len(call.Args) < 4 && v.strict {
 		v.issues = append(v.issues, Issue{
-			Metric: "",
-			Pos:    v.fs.Position(call.Pos()),
-			Text:   "NewDesc should have at least 4 args",
+			Pos:  call.Pos(),
+			Text: "NewDesc should have at least 4 args",
 		})
 		return nil, nil
 	}
