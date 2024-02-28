@@ -42,7 +42,9 @@ func Generate(reg *prometheus.Registry, w io.Writer, labelOverrides []LabelOverr
 					labelsToValues[label.GetName()] = make(map[string]struct{})
 				}
 				// Add the value to the set of values for this label
-				labelsToValues[label.GetName()][label.GetValue()] = struct{}{}
+				if val := label.GetValue(); val != "" {
+					labelsToValues[label.GetName()][val] = struct{}{}
+				}
 			}
 		}
 
