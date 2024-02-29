@@ -13,7 +13,7 @@ import (
 )
 
 // Generate
-func Generate(reg *prometheus.Registry, w io.Writer, labelOverrides []LabelOverrides) error {
+func Generate(reg *prometheus.Registry, w io.Writer, config *Config) error {
 	metricsFamilies, err := reg.Gather()
 	if err != nil {
 		return err
@@ -49,7 +49,7 @@ func Generate(reg *prometheus.Registry, w io.Writer, labelOverrides []LabelOverr
 		}
 
 		// Support overriding the values of labels, in case they're not suitable for docs.
-		for _, override := range labelOverrides {
+		for _, override := range config.LabelOverrides {
 			if override.Metric != metric.GetName() {
 				continue
 			}
@@ -92,14 +92,4 @@ func Generate(reg *prometheus.Registry, w io.Writer, labelOverrides []LabelOverr
 		}
 	}
 	return nil
-}
-
-type LabelValues struct {
-	Label  string
-	Values []string
-}
-
-type LabelOverrides struct {
-	Metric    string
-	Overrides []LabelValues
 }
