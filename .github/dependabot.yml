@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: daily
+    commit-message:
+      prefix: "vendor:"
+    open-pull-requests-limit: 5
+    rebase-strategy: disabled
+    labels:
+      - dependencies
