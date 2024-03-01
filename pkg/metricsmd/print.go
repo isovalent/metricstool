@@ -19,7 +19,11 @@ import (
 // NewCmd creates a Cobra command for generating metrics reference docs.
 // It's intended to be used as an add-on to applications that have a Cobra CLI
 // and expose Prometheus metrics.
-func NewCmd(vp *viper.Viper, log *slog.Logger, config *Config) *cobra.Command {
+func NewCmd(vp *viper.Viper, log *slog.Logger, config *Config) (*cobra.Command, error) {
+	err := validateConfig(config)
+	if err != nil {
+		return nil, err
+	}
 	cmd := &cobra.Command{
 		Use:         "metrics-docs",
 		Hidden:      true,
@@ -65,5 +69,5 @@ func NewCmd(vp *viper.Viper, log *slog.Logger, config *Config) *cobra.Command {
 			return nil
 		},
 	}
-	return cmd
+	return cmd, nil
 }
