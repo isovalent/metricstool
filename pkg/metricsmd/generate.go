@@ -24,7 +24,11 @@ func Generate(reg *prometheus.Registry, w io.Writer, config *Config) error {
 
 	for _, metric := range metricsFamilies {
 		// Include the metric name and help text.
-		io.WriteString(w, fmt.Sprintf("## `%s`\n\n", metric.GetName()))
+		h := "##"
+		for i := 0; i < config.HeadingLevel; i++ {
+			h += "#"
+		}
+		io.WriteString(w, fmt.Sprintf("%s `%s`\n\n", h, metric.GetName()))
 		io.WriteString(w, fmt.Sprintf("%s\n\n", metric.GetHelp()))
 		// The rest is generating a list of label names and values
 
